@@ -83,7 +83,7 @@ def read_black_config(src: Path, value: Optional[str]) -> BlackArgs:
     return cast(
         BlackArgs,
         {
-            key: value
+            key: str(value)
             for key, value in config.items()
             if key
             in ["line_length", "skip_string_normalization", "skip_magic_trailing_comma"]
