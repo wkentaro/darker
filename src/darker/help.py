@@ -48,6 +48,12 @@ STDOUT = (
     " `pygments` package is available, or if enabled by configuration."
 )
 
+STDIN_FILENAME = (
+    "The path to the file when passing it through stdin. Useful so Darker can find the"
+    " previous version from Git. Only valid with `--revision=<rev1>..` (which"
+    " implies `:WORKTREE:` as the default for `rev2`)."
+)
+
 ISORT_PARTS = ["Also sort imports using the `isort` package"]
 if not isort:
     ISORT_PARTS.append(f". {ISORT_INSTRUCTION} to enable usage of this option.")
