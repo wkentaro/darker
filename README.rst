@@ -298,6 +298,10 @@ The following `command line arguments`_ can also be used to modify the defaults:
        Force complete reformatted output to stdout, instead of in-place. Only valid if
        there's just one file to reformat. Highlight syntax if on a terminal and the
        ``pygments`` package is available, or if enabled by configuration.
+--stdin-filename PATH
+       The path to the file when passing it through stdin. Useful so Darker can find the
+       previous version from Git. Only valid with ``--revision=<rev1>..`` (which implies
+       ``:WORKTREE:`` as the default for ``rev2``).
 --check
        Don't write the files back, just return the status. Return code 0 means nothing
        would change. Return code 1 means some files would be reformatted.
