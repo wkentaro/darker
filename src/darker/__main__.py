@@ -22,6 +22,7 @@ from darker.concurrency import get_executor
 from darker.config import Exclusions, OutputMode, dump_config
 from darker.diff import diff_chunks
 from darker.exceptions import DependencyError, MissingPackageError
+from darker.fstring import apply_flynt, flynt
 from darker.git import (
     PRE_COMMIT_FROM_TO_REFS,
     WORKTREE,
@@ -60,7 +61,7 @@ def format_edited_parts(
     report_unmodified: bool,
     workers: int = 1,
 ) -> Generator[ProcessedDocument, None, None]:
-    """Black (and optional isort) formatting modified chunks in a set of files
+    """Black (and optional isort and flynt) formatting modified chunks in a set of files
 
     Files inside given directories and excluded by Black's configuration are not
     reformatted using Black, but their imports are still sorted. Also, linters will be
@@ -71,7 +72,7 @@ def format_edited_parts(
     :param root: The common root of all files to reformat
     :param changed_files: Python files and explicitly requested files which have been
                           modified in the repository between the given Git revisions
-    :param exclude: Files to exclude when running Black, and when running ``isort``
+    :param exclude: Files to exclude when running Black,``isort`` or ``flynt``
     :param revrange: The Git revisions to compare
     :param black_config: Configuration to use for running Black
     :param report_unmodified: ``True`` to yield also files which weren't modified
@@ -86,7 +87,7 @@ def format_edited_parts(
         edited_linenums_differ = EditedLinenumsDiffer(root, revrange)
         for relative_path_in_rev2 in sorted(changed_files):
             future = executor.submit(
-                _isort_and_blacken_single_file,
+                _modify_and_reformat_single_file,
                 root,
                 relative_path_in_rev2,
                 edited_linenums_differ,
@@ -106,7 +107,7 @@ def format_edited_parts(
                 yield (absolute_path_in_rev2, rev2_content, content_after_reformatting)
 
 
-def _isort_and_blacken_single_file(  # pylint: disable=too-many-arguments
+def _modify_and_reformat_single_file(  # pylint: disable=too-many-arguments
     root: Path,
     relative_path_in_rev2: Path,
     edited_linenums_differ: EditedLinenumsDiffer,
@@ -114,11 +115,11 @@ def _isort_and_blacken_single_file(  # pylint: disable=too-many-arguments
     revrange: RevisionRange,
     black_config: BlackConfig,
 ) -> ProcessedDocument:
-    """Black and/or isort formatting for modified chunks in a single file
+    """Black, isort and/or flynt formatting for modified chunks in a single file
 
     :param root: Root directory for the relative path
     :param relative_path_in_rev2: Relative path to a Python source code file
-    :param exclude: Files to exclude when running Black, and when running ``isort``
+    :param exclude: Files to exclude when running Black, ``isort`` or ``flynt``
     :param revrange: The Git revisions to compare
     :param black_config: Configuration to use for running Black
     :return: Details about changes for the file
@@ -140,30 +141,29 @@ def _isort_and_blacken_single_file(  # pylint: disable=too-many-arguments
         black_config.get("line_length"),
     )
     has_isort_changes = rev2_isorted != rev2_content
-    if not glob_any(relative_path_in_rev2, exclude.black):
-        # 9. A re-formatted Python file which produces an identical AST was
-        #    created successfully - write an updated file or print the diff if
-        #    there were any changes to the original
-        content_after_reformatting = _blacken_single_file(
-            root,
-            relative_path_in_rev2,
-            get_path_in_repo(relative_path_in_rev2),
-            edited_linenums_differ,
-            rev2_content,
-            rev2_isorted,
-            has_isort_changes,
-            black_config,
-        )
-    else:
-        # File was excluded by Black configuration, don't reformat
-        content_after_reformatting = rev2_isorted
+    # 9. A re-formatted Python file which produces an identical AST was
+    #    created successfully - write an updated file or print the diff if
+    #    there were any changes to the original
+    content_after_reformatting = _blacken_and_flynt_single_file(
+        root,
+        relative_path_in_rev2,
+        get_path_in_repo(relative_path_in_rev2),
+        exclude,
+        edited_linenums_differ,
+        rev2_content,
+        rev2_isorted,
+        has_isort_changes,
+        black_config,
+    )
     return absolute_path_in_rev2, rev2_content, content_after_reformatting
 
 
-def _blacken_single_file(  # pylint: disable=too-many-arguments,too-many-locals
+def _blacken_and_flynt_single_file(
+    # pylint: disable=too-many-arguments,too-many-locals
     root: Path,
     relative_path_in_rev2: Path,
     relative_path_in_repo: Path,
+    exclude: Exclusions,
     edited_linenums_differ: EditedLinenumsDiffer,
     rev2_content: TextDocument,
     rev2_isorted: TextDocument,
@@ -177,6 +177,7 @@ def _blacken_single_file(  # pylint: disable=too-many-arguments,too-many-locals
                                   VSCode ``.py.<HASH>.tmp`` file in the working tree.
     :param relative_path_in_repo: Relative path to source in the Git repository. Same as
                                   ``relative_path_in_rev2`` save for VSCode temp files.
+    :param exclude: Files to exclude when running Black, ``isort`` or ``flynt``
     :param edited_linenums_differ: Helper for finding out which lines were edited
     :param rev2_content: Contents of the file at ``revrange.rev2``
     :param rev2_isorted: Contents of the file after optional import sorting
@@ -189,20 +190,45 @@ def _blacken_single_file(  # pylint: disable=too-many-arguments,too-many-locals
     absolute_path_in_rev2 = root / relative_path_in_rev2
 
     # 4. run black
-    formatted = run_black(rev2_isorted, black_config)
     logger.debug(
         "Read %s lines from edited file %s",
         len(rev2_isorted.lines),
         absolute_path_in_rev2,
     )
-    logger.debug("Black reformat resulted in %s lines", len(formatted.lines))
+    if glob_any(relative_path_in_rev2, exclude.flynt):
+        # `--flynt` option not specified, don't reformat
+        fstringified = rev2_isorted
+        has_fstring_changes = False
+    else:
+        fstringified = apply_flynt(
+            rev2_isorted,
+            relative_path_in_rev2,
+            exclude.flynt,
+            edited_linenums_differ,
+        )
+        has_fstring_changes = fstringified != rev2_isorted
+        logger.debug(
+            "Flynt resulted in %s lines, with %s changes from fstringification",
+            len(fstringified.lines),
+            "some" if has_fstring_changes else "no",
+        )
+    if glob_any(relative_path_in_rev2, exclude.black):
+        # File was excluded by Black configuration, don't reformat
+        formatted = fstringified
+    else:
+        formatted = run_black(fstringified, black_config)
+        logger.debug(
+            "Black reformat resulted in %s lines, with %s changes from reformatting",
+            len(formatted.lines),
+            "no" if formatted == fstringified else "some",
+        )
 
-    # 5. get the diff between the edited and reformatted file
+    # 5. get the diff between the edited and stringified and reformatted file
     # 6. convert the diff into chunks
-    black_chunks = diff_chunks(rev2_isorted, formatted)
+    new_chunks = diff_chunks(rev2_isorted, formatted)
 
     # Exit early if nothing to do
-    if not black_chunks:
+    if not new_chunks:
         return rev2_isorted
 
     max_context_lines = len(rev2_isorted.lines)
@@ -231,21 +257,21 @@ def _blacken_single_file(  # pylint: disable=too-many-arguments,too-many-locals
 
         # 7. choose reformatted content
         chosen = TextDocument.from_lines(
-            choose_lines(black_chunks, edited_linenums),
+            choose_lines(new_chunks, edited_linenums),
             encoding=rev2_content.encoding,
             newline=rev2_content.newline,
             mtime=datetime.utcnow().strftime(GIT_DATEFORMAT),
         )
 
         # 8. verify
-        logger.debug(
-            "Verifying that the %s original edited lines and %s reformatted lines "
-            "parse into an identical abstract syntax tree",
-            len(rev2_isorted.lines),
-            len(chosen.lines),
-        )
-        if not verifier.is_equivalent_to_baseline(chosen):
-            debug_dump(black_chunks, edited_linenums)
+        if not has_fstring_changes and not verifier.is_equivalent_to_baseline(chosen):
+            logger.debug(
+                "Verifying that the %s original edited lines and %s reformatted lines "
+                "parse into an identical abstract syntax tree",
+                len(rev2_isorted.lines),
+                len(chosen.lines),
+            )
+            debug_dump(new_chunks, edited_linenums)
             logger.debug(
                 "AST verification of %s with %s lines of context failed",
                 absolute_path_in_rev2,
@@ -253,6 +279,10 @@ def _blacken_single_file(  # pylint: disable=too-many-arguments,too-many-locals
             )
             minimum_context_lines.respond(False)
         else:
+            if has_fstring_changes:
+                logger.debug("AST verification disabled due to fstringification")
+            else:
+                logger.debug("AST verification success")
             minimum_context_lines.respond(True)
             last_successful_reformat = chosen
     if not last_successful_reformat:
@@ -382,6 +412,11 @@ def main(argv: List[str] = None) -> int:
             f"{get_extra_instruction('isort')} to use the `--isort` option."
         )
 
+    if args.flynt and not flynt:
+        raise MissingPackageError(
+            f"{get_extra_instruction('flynt')} to use the `--flynt` option."
+        )
+
     black_config = read_black_config(tuple(args.src), args.config)
     if args.config:
         black_config["config"] = args.config
@@ -453,7 +488,11 @@ def main(argv: List[str] = None) -> int:
         format_edited_parts(
             root,
             changed_files_to_process,
-            Exclusions(black=black_exclude, isort=set() if args.isort else {"**/*"}),
+            Exclusions(
+                black=black_exclude,
+                isort=set() if args.isort else {"**/*"},
+                flynt=set() if args.flynt else {"**/*"},
+            ),
             revrange,
             black_config,
             report_unmodified=output_mode == OutputMode.CONTENT,
