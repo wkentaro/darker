@@ -469,7 +469,10 @@ def test_help_with_isort_package(capsys):
     """``darker --help`` omits ``isort`` installation instructions if it is installed"""
     with isort_present(True):
 
-        assert "Please run" not in get_darker_help_output(capsys)
+        assert (
+            "Please run `pip install darker[isort]` to enable "
+            not in get_darker_help_output(capsys)
+        )
 
 
 @pytest.mark.kwparametrize(
